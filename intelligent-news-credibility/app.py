@@ -5,6 +5,9 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import os
+import pickle
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import plotly.figure_factory as ff
 st.set_page_config(
     page_title="Intelligent News Credibility Analyzer",
     page_icon="📰",
@@ -38,6 +41,17 @@ def load_model():
 
 model , vectorizer = load_model()
 
+# loading the test data for model performance metrics
+@st.cache_data
+def load_test_data():
+    base_dir = os.path.dirname(__file__)
+    ml_dir = os.path.join(base_dir, "ml")
+    X_test = pickle.load(open(os.path.join(ml_dir, "X_test.pkl"), "rb"))
+    y_test = pickle.load(open(os.path.join(ml_dir, "y_test.pkl"), "rb"))
+    return X_test, y_test
+
+X_test, y_test = load_test_data()
+
 
 # making the ui of the app . 
 st.title("📰 Intelligent News Credibility Analyzer")
@@ -49,6 +63,49 @@ This system analyzes **news articles** using **classical NLP & Machine Learning*
 to assess **credibility risk** based on textual patterns.
 """
 )
+
+# -------- MODEL PERFORMANCE SECTION --------
+with st.expander("📈 Model Performance Metrics", expanded=False):
+    y_pred = model.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
+
+    # Metric cards in columns
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Accuracy", f"{acc:.4f}")
+    col2.metric("Precision", f"{prec:.4f}")
+    col3.metric("Recall", f"{rec:.4f}")
+    col4.metric("F1 Score", f"{f1:.4f}")
+
+    st.markdown("---")
+
+    # Confusion Matrix Heatmap
+    st.subheader("Confusion Matrix")
+    labels = ["Fake (0)", "Real (1)"]
+    cm_text = [[str(val) for val in row] for row in cm]
+    fig = ff.create_annotated_heatmap(
+        z=cm.tolist(),
+        x=labels,
+        y=labels,
+        annotation_text=cm_text,
+        colorscale="Blues",
+        showscale=True,
+    )
+    fig.update_layout(
+        xaxis_title="Predicted Label",
+        yaxis_title="Actual Label",
+        xaxis=dict(side="bottom"),
+        width=500,
+        height=400,
+    )
+    fig.update_yaxes(autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
 
 # taking input from the user .
 input_type = st.radio(
