@@ -5,7 +5,6 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-Deployment-red.svg)
 ![Accuracy](https://img.shields.io/badge/Accuracy-98%25-brightgreen.svg)
 
-
 A machine learning-based news credibility classification system that leverages classical NLP techniques and Logistic Regression to distinguish between fake and real news articles with approximately **98% accuracy**.
 
 ---
