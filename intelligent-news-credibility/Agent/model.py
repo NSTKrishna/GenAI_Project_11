@@ -35,6 +35,8 @@ from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
 from langchain_groq import ChatGroq
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.tools.tavily_search import TavilySearchResults
 
 load_dotenv()
@@ -63,7 +65,7 @@ class ClaimsOutput(BaseModel):
 
 # --- Base LLM for general text generation (used in assessment node) ---
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",
+    model="llama-3.3-70b-versatile",
     temperature=0,                          # Deterministic output
     api_key=os.getenv("GROQ_API_KEY"),
 )
@@ -74,11 +76,31 @@ structured_llm = llm.with_structured_output(ClaimsOutput)
 
 
 # ==============================================================================
-# SECTION 3: Tavily Web Search Tool Initialization
+# SECTION 3: Retrievers Initialization (Tavily & Chroma)
 # ==============================================================================
 
-# Uses TAVILY_API_KEY from environment internally
-retriever = TavilySearchResults(max_results=3)
+# --- Tavily Web Search ---
+tavily_retriever = TavilySearchResults(max_results=3)
+
+# --- ChromaDB Vector Store ---
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+embeddings = HuggingFaceEmbeddings(
+    model_name=EMBEDDING_MODEL_NAME,
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
+)
+
+CHROMA_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+vectorstore = Chroma(
+    persist_directory=CHROMA_DB_DIR,
+    embedding_function=embeddings,
+    collection_name="liar_fact_checks",
+)
+
+chroma_retriever = vectorstore.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={"score_threshold": 0.5, "k": 3}
+)
 
 
 # ==============================================================================
@@ -87,6 +109,7 @@ retriever = TavilySearchResults(max_results=3)
 
 class AgentState(TypedDict):
     article_text: str                          # Raw input article text
+    search_mode: str                           # 'chroma' or 'tavily'
     extracted_claims: List[Claim]               # Claims extracted by Node 1
     retrieval_results: Dict[str, str]           # Claim → Evidence mapping from Node 2
     final_report: str                           # Credibility report from Node 3
@@ -137,69 +160,50 @@ RULES:
 
 # --- Sentinel string for unverified claims ---
 # This exact string is checked by the assessment prompt to prevent hallucination.
-NO_EVIDENCE_SENTINEL = "NO VERIFIED EVIDENCE FOUND IN WEB SEARCH."
+NO_EVIDENCE_SENTINEL_CHROMA = "NO VERIFIED EVIDENCE FOUND IN FACT-CHECK DATABASE."
+NO_EVIDENCE_SENTINEL_TAVILY = "NO VERIFIED EVIDENCE FOUND IN WEB SEARCH."
 
 
 def retrieve_facts_node(state: AgentState) -> AgentState:
-    """
-    NODE 2: Query the ChromaDB vector store for each extracted claim.
-
-    HOW IT WORKS:
-      1. Iterates through each claim from Node 1.
-      2. For each claim, queries the threshold retriever.
-      3. TWO POSSIBLE OUTCOMES per claim:
-         a) MATCH FOUND (docs returned):
-            - Combines the page_content of all matching documents
-            - Stores them as the evidence string for this claim
-         b) NO MATCH (empty list returned):
-            - The similarity score of all documents was below 0.5
-            - We map this claim to the sentinel string:
-              "NO VERIFIED EVIDENCE FOUND IN WEB SEARCH."
-            - This is CRITICAL: it tells Node 3 NOT to hallucinate.
-
-    WHY THIS MATTERS:
-      Without this threshold + sentinel pattern, the LLM would try to
-      "helpfully" verify claims using its training data — which could
-      be outdated, incorrect, or completely fabricated. By explicitly
-      flagging missing evidence, we force the LLM to admit uncertainty.
-    """
     claims = state.get("extracted_claims", [])
-    retrieval_results: Dict[str, str] = {}
+    search_mode = state.get("search_mode", "tavily")
+    retrieval_results = {}
 
     if not claims:
         print("⚠️  No claims to retrieve evidence for.")
         return {"retrieval_results": {}}
 
-    print(f"\n📚 Retrieving evidence for {len(claims)} claims from ChromaDB...")
+    print(f"📚 Retrieving evidence for {len(claims)} claims from {search_mode.upper()}...")
 
     for i, claim_obj in enumerate(claims):
         claim_text = claim_obj.claim
-        print(f"\n   🔎 [{i+1}/{len(claims)}] Querying: \"{claim_text[:80]}...\"")
+        print(f"🔎 [{i+1}/{len(claims)}] Querying: \"{claim_text[:80]}...\"")
 
         try:
-            # --- Query the threshold retriever ---
-            # This returns ONLY documents with similarity >= 0.5.
-            # If nothing qualifies, it returns an EMPTY list.
-            matched_docs = retriever.invoke(claim_text)
-
-            if matched_docs:
-                # --- MATCH FOUND: Combine all matched documents ---
-                print(f"      ✅ Found {len(matched_docs)} relevant fact-check(s).")
-
-                # Join all matched documents' content with a separator
-                combined_evidence = "\n---\n".join(
-                    doc.page_content for doc in matched_docs
-                )
-                retrieval_results[claim_text] = combined_evidence
+            if search_mode == "chroma":
+                matched_docs = chroma_retriever.invoke(claim_text)
+                if matched_docs:
+                    print(f"      ✅ Found {len(matched_docs)} relevant fact-check(s) in ChromaDB.")
+                    combined_evidence = "\n---\n".join(doc.page_content for doc in matched_docs)
+                    retrieval_results[claim_text] = combined_evidence
+                else:
+                    print(f"      ⚠️  No evidence found above threshold (0.5).")
+                    retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL_CHROMA
             else:
-                # --- NO MATCH: Use the sentinel string ---
-                print(f"      ⚠️  No evidence found above threshold (0.5).")
-                retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL
+                matched_docs = tavily_retriever.invoke(claim_text)
+                if matched_docs:
+                    print(f"      ✅ Found {len(matched_docs)} relevant results from Web.")
+                    combined_evidence = "\n---\n".join(doc['content'] for doc in matched_docs if isinstance(doc, dict) and 'content' in doc)
+                    if not combined_evidence:
+                        combined_evidence = "\n---\n".join(str(doc) for doc in matched_docs)
+                    retrieval_results[claim_text] = combined_evidence
+                else:
+                    print(f"      ⚠️  No evidence found in web search.")
+                    retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL_TAVILY
 
         except Exception as e:
-            # --- Error during retrieval: treat as no evidence ---
             print(f"      ❌ Retrieval error: {e}")
-            retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL
+            retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL_CHROMA if search_mode == "chroma" else NO_EVIDENCE_SENTINEL_TAVILY
 
     return {"retrieval_results": retrieval_results}
 
@@ -242,7 +246,8 @@ def generate_assessment_node(state: AgentState) -> AgentState:
     context_parts = []
     for i, claim_obj in enumerate(claims):
         claim_text = claim_obj.claim
-        evidence = retrieval_results.get(claim_text, NO_EVIDENCE_SENTINEL)
+        # Fallback if not found properly
+        evidence = retrieval_results.get(claim_text, NO_EVIDENCE_SENTINEL_CHROMA)
         context_parts.append(
             f"CLAIM {i+1}: \"{claim_text}\"\n"
             f"RETRIEVED EVIDENCE:\n{evidence}"
@@ -259,8 +264,8 @@ def generate_assessment_node(state: AgentState) -> AgentState:
 STRICT RULES — YOU MUST FOLLOW THESE WITHOUT EXCEPTION:
 
 1. For each claim, analyze ONLY the retrieved evidence provided below.
-2. If the retrieved evidence for a claim says 'NO VERIFIED EVIDENCE FOUND IN WEB SEARCH.', 
-   you MUST state in your Verdict that the claim is 'Unverified due to lack of web evidence'. 
+2. If the retrieved evidence for a claim says 'NO VERIFIED EVIDENCE FOUND IN WEB SEARCH.' or 'NO VERIFIED EVIDENCE FOUND IN FACT-CHECK DATABASE.', 
+   you MUST state in your Verdict that the claim is 'Unverified due to lack of evidence'. 
    DO NOT invent facts, guess, or use baseline knowledge to verify the claim.
 3. DO NOT fabricate sources, citations, URLs, or fact-check results.
 4. If evidence IS found, compare the claim against the evidence and give your verdict 
