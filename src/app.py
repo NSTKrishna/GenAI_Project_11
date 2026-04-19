@@ -19,6 +19,24 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.agents.agent_pipeline import workflow
 from src.utils.text_processing import extract_text
+from src.ml.bootstrap_assets import bootstrap_ml_assets
+
+
+def ensure_local_chroma_db() -> None:
+    """Build the local LIAR ChromaDB on first run.
+
+    This is required for the "ChromaDB (Local LIAR Dataset)" RAG mode.
+    """
+
+    from src.agents.agent_pipeline import CHROMA_DB_DIR
+
+    if os.path.exists(CHROMA_DB_DIR) and os.listdir(CHROMA_DB_DIR):
+        return
+
+    from src.agents.build_database import main as build_db_main
+
+    os.makedirs(CHROMA_DB_DIR, exist_ok=True)
+    build_db_main()
 
 st.set_page_config(
     page_title="Intelligent News Credibility Analyzer",
@@ -38,6 +56,9 @@ def load_model():
     model_path = os.path.join(base_dir, "ml", "models", "model.pkl")
     vectorizer_path = os.path.join(base_dir, "ml", "models", "vectorizer.pkl")
 
+    if not (os.path.exists(model_path) and os.path.exists(vectorizer_path)):
+        bootstrap_ml_assets(base_dir)
+
     model = joblib.load(model_path)
     vectorizer = joblib.load(vectorizer_path)
     return model, vectorizer
@@ -49,8 +70,16 @@ model , vectorizer = load_model()
 def load_test_data():
     base_dir = os.path.dirname(__file__)
     data_dir = os.path.join(base_dir, "ml", "data")
-    X_test = pickle.load(open(os.path.join(data_dir, "X_test.pkl"), "rb"))
-    y_test = pickle.load(open(os.path.join(data_dir, "y_test.pkl"), "rb"))
+
+    x_test_path = os.path.join(data_dir, "X_test.pkl")
+    y_test_path = os.path.join(data_dir, "y_test.pkl")
+    if not (os.path.exists(x_test_path) and os.path.exists(y_test_path)):
+        bootstrap_ml_assets(base_dir)
+
+    with open(x_test_path, "rb") as f:
+        X_test = pickle.load(f)
+    with open(y_test_path, "rb") as f:
+        y_test = pickle.load(f)
     return X_test, y_test
 
 X_test, y_test = load_test_data()
@@ -106,7 +135,7 @@ with st.expander("📈 Model Performance Metrics", expanded=False):
         height=400,
     )
     fig.update_yaxes(autorange="reversed")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 st.markdown("---")
 
@@ -208,9 +237,13 @@ if st.button("Run Agentic Fact Check"):
     else:
         with st.spinner("🤖 Agent is extracting claims and checking facts... This may take a minute."):
             try:
+                if search_mode == "chroma":
+                    with st.spinner("Preparing local ChromaDB (first run may take a few minutes)..."):
+                        ensure_local_chroma_db()
+
                 # Truncate text to fit within Llama 3.1 8b TPM limits (roughly 6000 TPM)
                 safe_text = article_text[:10000]
-                if len(article_text) > 10000000:
+                if len(article_text) > 10000:
                     st.info("Note: Article text was truncated to fit within API token limits.")
 
                 # Invoke the LangGraph workflow

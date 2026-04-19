@@ -61,13 +61,15 @@ pip install -r requirements.txt
 ### 4. Configuration
 Create a `.env` file in the root directory using the provided example:
 ```bash
-cp .env.example .env
+cp config/.env.example .env
 ```
 Add your API keys to the `.env` file:
 ```ini
 GROQ_API_KEY=your_groq_api_key
 TAVILY_API_KEY=your_tavily_api_key
 ```
+
+**Streamlit Community Cloud**: set `GROQ_API_KEY` and `TAVILY_API_KEY` in the app’s **Secrets** (Settings → Secrets). Do not commit API keys into the repo.
 
 ### 5. Build Local Vector Database (Optional)
 To use the local ChromaDB fact-checking capabilities, build the database first:
@@ -79,7 +81,7 @@ python src/agents/build_database.py
 
 To run the Streamlit interface locally:
 ```bash
-streamlit run src/app.py
+streamlit run app.py
 ```
 This will start the server and open the app in your default web browser.
 
