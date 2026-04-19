@@ -29,17 +29,43 @@
 """
 
 import os
+from pathlib import Path
+
+# Avoid noisy Chroma telemetry errors when posthog versions mismatch.
+# chromadb.config.Settings reads the lowercase key name from env.
+os.environ.setdefault("anonymized_telemetry", "False")
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+from functools import lru_cache
 from typing import TypedDict, List, Dict
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
-from langchain_groq import ChatGroq
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.tools.tavily_search import TavilySearchResults
 
-load_dotenv()
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Prefer an explicit project-local env file if present.
+# Fallback to config/.env.example for convenience in this repo.
+for _candidate in (
+    _PROJECT_ROOT / ".env",
+    _PROJECT_ROOT / "config" / ".env",
+):
+    if _candidate.exists():
+        load_dotenv(dotenv_path=_candidate, override=False)
+        break
+else:
+    load_dotenv(override=False)
+
+
+def _get_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 # ==============================================================================
@@ -63,44 +89,99 @@ class ClaimsOutput(BaseModel):
 # SECTION 2: LLM Initialization (Groq API — Llama 3.1 8B)
 # ==============================================================================
 
-# --- Base LLM for general text generation (used in assessment node) ---
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0,                          # Deterministic output
-    api_key=os.getenv("GROQ_API_KEY"),
-)
+@lru_cache(maxsize=1)
+def get_llm():
+    """Lazily create the Groq chat model.
 
-# --- Structured LLM for claim extraction (returns Pydantic objects) ---
-# This wraps the same model but forces it to output valid ClaimsOutput JSON.
-structured_llm = llm.with_structured_output(ClaimsOutput)
+    Returns None if the dependency or API key is missing.
+    """
+
+    api_key = _get_env("GROQ_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        from langchain_groq import ChatGroq
+
+        return ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            api_key=api_key,
+        )
+    except Exception as e:
+        print(f"❌ Failed to initialize Groq LLM: {e}")
+        return None
+
+
+@lru_cache(maxsize=1)
+def get_structured_llm():
+    llm = get_llm()
+    if llm is None:
+        return None
+    return llm.with_structured_output(ClaimsOutput)
 
 
 # ==============================================================================
 # SECTION 3: Retrievers Initialization (Tavily & Chroma)
 # ==============================================================================
 
-# --- Tavily Web Search ---
-tavily_retriever = TavilySearchResults(max_results=3)
+@lru_cache(maxsize=1)
+def get_tavily_retriever():
+    """Lazily create the Tavily retriever.
+
+    Returns None if TAVILY_API_KEY isn't configured.
+    """
+
+    if not _get_env("TAVILY_API_KEY"):
+        return None
+
+    try:
+        return TavilySearchResults(max_results=3)
+    except Exception as e:
+        print(f"❌ Failed to initialize Tavily retriever: {e}")
+        return None
 
 # --- ChromaDB Vector Store ---
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL_NAME,
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
+CHROMA_DB_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data",
+    "chroma_db",
 )
 
-CHROMA_DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "chroma_db")
-vectorstore = Chroma(
-    persist_directory=CHROMA_DB_DIR,
-    embedding_function=embeddings,
-    collection_name="liar_fact_checks",
-)
 
-chroma_retriever = vectorstore.as_retriever(
-    search_type="similarity_score_threshold",
-    search_kwargs={"score_threshold": 0.5, "k": 3}
-)
+@lru_cache(maxsize=1)
+def get_chroma_retriever():
+    """Lazily create the Chroma retriever.
+
+    Returns None if initialization fails (missing deps/model/db).
+    """
+
+    try:
+        from chromadb.config import Settings
+
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+        client_settings = Settings(anonymized_telemetry=False, is_persistent=True, persist_directory=CHROMA_DB_DIR)
+
+        vectorstore = Chroma(
+            persist_directory=CHROMA_DB_DIR,
+            embedding_function=embeddings,
+            collection_name="liar_fact_checks",
+            client_settings=client_settings,
+        )
+
+        return vectorstore.as_retriever(
+            search_type="similarity_score_threshold",
+            search_kwargs={"score_threshold": 0.5, "k": 3},
+        )
+    except Exception as e:
+        print(f"❌ Failed to initialize Chroma retriever: {e}")
+        return None
 
 
 # ==============================================================================
@@ -136,6 +217,11 @@ RULES:
 """
 
     try:
+        structured_llm = get_structured_llm()
+        if structured_llm is None:
+            print("⚠️  Claim extraction unavailable (missing GROQ_API_KEY or langchain-groq).")
+            return {"extracted_claims": []}
+
         # Invoke the structured LLM — it returns a ClaimsOutput Pydantic object
         result = structured_llm.invoke(
             prompt + f"\n\nArticle:\n{article_text}"
@@ -181,6 +267,11 @@ def retrieve_facts_node(state: AgentState) -> AgentState:
 
         try:
             if search_mode == "chroma":
+                chroma_retriever = get_chroma_retriever()
+                if chroma_retriever is None:
+                    retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL_CHROMA
+                    continue
+
                 matched_docs = chroma_retriever.invoke(claim_text)
                 if matched_docs:
                     print(f"      ✅ Found {len(matched_docs)} relevant fact-check(s) in ChromaDB.")
@@ -190,6 +281,11 @@ def retrieve_facts_node(state: AgentState) -> AgentState:
                     print(f"      ⚠️  No evidence found above threshold (0.5).")
                     retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL_CHROMA
             else:
+                tavily_retriever = get_tavily_retriever()
+                if tavily_retriever is None:
+                    retrieval_results[claim_text] = NO_EVIDENCE_SENTINEL_TAVILY
+                    continue
+
                 matched_docs = tavily_retriever.invoke(claim_text)
                 if matched_docs:
                     print(f"      ✅ Found {len(matched_docs)} relevant results from Web.")
@@ -294,6 +390,15 @@ Generate a detailed credibility report following the format specified.
 """
 
     try:
+        llm = get_llm()
+        if llm is None:
+            return {
+                "final_report": (
+                    "⚠️ Agentic fact-checking is not configured. "
+                    "Set GROQ_API_KEY (and install langchain-groq) to enable report generation."
+                )
+            }
+
         # --- Invoke the LLM to generate the final report ---
         print("\n📝 Generating credibility assessment report...")
         response = llm.invoke([

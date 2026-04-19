@@ -23,6 +23,11 @@
 """
 
 import os
+
+# Avoid noisy Chroma telemetry errors when posthog versions mismatch.
+# chromadb.config.Settings reads the lowercase key name from env.
+os.environ.setdefault("anonymized_telemetry", "False")
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 import shutil
 from datasets import load_dataset
 from langchain_core.documents import Document
@@ -209,10 +214,14 @@ def build_chroma_db(documents: list[Document], embeddings):
     #   1. Embeds each document's page_content using the embedding function
     #   2. Stores the embeddings + metadata in the vector store
     #   3. Persists everything to the specified directory
+    from chromadb.config import Settings
+    client_settings = Settings(anonymized_telemetry=False, is_persistent=True, persist_directory=CHROMA_DB_DIR)
+
     vectorstore = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
         persist_directory=CHROMA_DB_DIR,
+        client_settings=client_settings,
         collection_name="liar_fact_checks",  # Name of the collection inside Chroma
     )
 
