@@ -195,14 +195,28 @@ It should be used as a **decision-support system**, not a final authority.
                 """
             )
 
-        st.markdown("---")
-        st.subheader("🕵️‍♂️ Agentic Fact-Checking (Tavily Search + Llama 3.1)")
-        st.caption("Validates specific claims dynamically across the web using Tavily Search.")
+# -------- SEPARATE AGENTIC FACT CHECKING SECTION --------
+st.markdown("---")
+st.subheader("🕵️‍♂️ Agentic Fact-Checking (Llama 3.1)")
+st.caption("Validates specific claims dynamically. Choose your preferred fact-checking source below.")
+
+search_source = st.radio("Select Fact-Check Source:", ["ChromaDB (Local LIAR Dataset)", "Tavily (Web Search)"])
+search_mode = "chroma" if "Chroma" in search_source else "tavily"
+
+if st.button("Run Agentic Fact Check"):
+    if not article_text.strip():
+        st.warning("Please provide article text or URL.")
         
+    else:
         with st.spinner("🤖 Agent is extracting claims and checking facts... This may take a minute."):
             try:
+                # Truncate text to fit within Llama 3.1 8b TPM limits (roughly 6000 TPM)
+                safe_text = article_text[:10000]
+                if len(article_text) > 10000000:
+                    st.info("Note: Article text was truncated to fit within API token limits.")
+
                 # Invoke the LangGraph workflow
-                initial_state = {"article_text": article_text}
+                initial_state = {"article_text": safe_text, "search_mode": search_mode}
                 final_state = workflow.invoke(initial_state)
                 
                 claims = final_state.get("extracted_claims", [])
@@ -220,13 +234,14 @@ It should be used as a **decision-support system**, not a final authority.
                             st.write(f"- **{c.entity}**: {c.claim}")
                             
                 # Show RAG Evidence
-                with st.expander("🌐 Retrieved Evidence from Web Search", expanded=False):
+                source_label = "ChromaDB Database" if search_mode == "chroma" else "Tavily Web Search"
+                with st.expander(f"🗄️ Retrieved Evidence from {source_label}", expanded=False):
                     for claim, evidence in retrieval_results.items():
                         st.markdown(f"**Claim:** {claim}")
                         if "NO VERIFIED EVIDENCE FOUND" in evidence:
                             st.warning(evidence)
                         else:
-                            st.success("Evidence found in database!")
+                            st.success(f"Evidence found in {source_label}!")
                             st.text(evidence[:500] + "..." if len(evidence) > 500 else evidence)
                         st.divider()
                 
